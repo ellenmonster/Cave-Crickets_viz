@@ -1,0 +1,1043 @@
+---
+title: "CUPN Cave Crickets Viz"
+output:
+  flexdashboard::flex_dashboard:
+    theme: yeti
+    orientation: columns
+runtime: shiny
+---
+
+```{r global, include=FALSE}
+
+rm(list=ls())
+
+### Load libraries -----
+# Will automatically install any libraries it can't find
+packages <- c("flexdashboard", 
+              "shiny", 
+              "readr",
+              "janitor",
+              "knitr",  
+              "plotly", 
+              "here",
+              "tidyverse",
+              "shinyWidgets", # for slider text inputs
+              "gridExtra", # for arranging plots
+              "magrittr",
+              "RColorBrewer",
+              "DT",
+              "reactable", # for reactive data tables
+              "htmltools", # for modifying reactable cells
+              "readxl", 
+              "readr",
+              "shinyBS", # for hover text
+              # "doParallel", # everything from here down is for regression tree analyses
+              # "forcats", 
+              "rpart", 
+              # "mda", 
+              # "ranger", 
+              # "e1071", 
+              # "nnet", 
+              # "gbm", 
+              # "mlr", 
+              "caret", 
+              "GGally",
+              "rattle" #rpart tree
+)
+
+package.check <- lapply(packages, FUN = function(x) {
+  if (!require(x, character.only = TRUE)) {
+    install.packages(x, dependencies = TRUE, repos = "http://cran.us.r-project.org")
+    library(x, character.only = TRUE)
+  }
+})
+
+rv <- reactiveValues(
+  dat_SS = NULL,
+  dat_cov = NULL,
+  df_ClustersInCommon = NULL,
+  df_TotDiff = NULL,
+  bar_TotDiff = NULL,
+  point_TotDiff = NULL,
+  df_SSDiff = NULL,
+  heatplot_SSDiff = NULL,
+  table_Diff = NULL
+) 
+
+
+```
+
+```{r css and html}
+# This expands maps to fill screen
+tags$style("map {
+           height: calc(100vh - 80px) !important;
+           }")
+
+# Add left and right margin padding on columns
+tags$style(".dashboard-column {
+    padding-left: 10px;
+    padding-right: 10px;
+}")
+
+# # # Add padding on plotly figures. Seems to only be for top and left of figure
+# tags$style(".js-plotly-plot .plotly, .js-plotly-plot .plotly div {
+#     padding: 10px;
+# }")
+
+# # This allows renderTables to scroll when overflow
+# tags$style(".chart-wrapper {
+#   overflow-x:scroll;
+#   overflow-y:scroll;
+# }")
+
+# tags$style("table.dataTable tbody th, table.dataTable tbody td input.form-control {
+#     padding: 2px 5px; 
+# }") # reduce padding in data tables
+
+
+# tags$style(".rank-list-title {
+#   font-size:14px;
+#   padding:4px;
+# }")
+
+tags$style(".reactable {
+font-size: 14px; 
+}") # font size for reactable tables
+
+# tag.map.title <- tags$style(HTML("
+#   .leaflet-control.map-title { 
+#     transform: translate(-50%,20%);
+#     position: fixed !important;
+#     left: 50%;
+#     text-align: center;
+#     padding-left: 10px; 
+#     padding-right: 10px; 
+#     background: rgba(255,255,255,0.75);
+#     font-weight: bold;
+#     font-size: 28px;
+#   }
+# ")) # add title to leaflet map
+
+# # Reactable bar chart function 
+# bar_chart <- function(label, width = "100%", height = "14px", fill = "#00bfc4", background = NULL) {
+#   bar <- div(style = list(background = fill, width = width, height = height))
+#   chart <- div(style = list(flexGrow = 1, marginLeft = "6px", background = background), bar)
+#   div(style = list(display = "flex", alignItems = "center"), label, chart)
+#   }
+
+# Reactable tooltip formatting
+with_tooltip <- function(value, tooltip) {
+  tags$abbr(style = "text-decoration: underline; text-decoration-style: dotted; cursor: help", title = tooltip, value)
+}
+```
+
+```{r functions}
+
+### FUNCTIONS ----
+FuncImport <- function(score_files) {
+
+  # Import and format cluster covariate data 
+  rv <- reactiveValues(
+  dat_SS = NULL,
+  dat_cov = NULL,
+  df_ClustersInCommon = NULL,
+  df_TotDiff = NULL,
+  bar_TotDiff = NULL,
+  point_TotDiff = NULL,
+  df_SSDiff = NULL,
+  heatplot_SSDiff = NULL,
+  table_Diff = NULL
+) # clear everything
+  
+  dat_cov <- read_excel(here::here("Data_in", "qryDashboardClusterCovariates.xlsx")) %>%
+    dplyr::rename(EventId = EventID, SurvDate = StartDate, Entrance = LocationDescription, ClusterNotes = Comment) %>%
+    dplyr::mutate(EventId = paste0("CC_", EventId),
+                  SurvDate = lubridate::as_date(SurvDate),
+                  ClusterId = paste(EventId, ClusterNumber, sep = "_clus")) %>%
+    dplyr::group_by(ClusterId) %>%
+    dplyr::mutate(StripPosMin = 10*min(BaselinePosition_meter, na.rm = TRUE)) %>% # when a cluster crosses multiple transects, keep the lowest strip position. This value is in units of transect widths (so 1/10 of a meter)
+    dplyr::select(-BaselinePosition_meter) %>%
+    dplyr::distinct() %>%
+    dplyr::mutate(
+      Proximal = StripPosMin + XminRelativeToStrip_cm/10, 
+      Distal = StripPosMin + 1 + XmaxRelativeToStrip_cm/10) %>% # calculate proximal and distal ends of each cluster, in units of transect width
+    dplyr::select(-XminRelativeToStrip_cm, -XmaxRelativeToStrip_cm) %>%
+    dplyr::mutate(ClusterSpan = round(Distal-Proximal, 2)) %>%
+    dplyr::distinct() %>%
+    dplyr::select(-Proximal, -Distal)
+  
+  # Read in scoring data
+  list_dat <- lapply(score_files, FUN = function(x) {
+    surveyor_name <-str_match(x, "Scores_(.*?)_")[2]
+    read_csv(here::here("Data_in", x)) %>%
+      clean_names("upper_camel") %>%
+      dplyr::mutate(Surveyor = surveyor_name)
+  })
+    dat <- do.call(plyr::"rbind.fill", list_dat) %>%
+      dplyr::rename(SurvDate = Date, ClusterNumber = ClusterN) %>%
+      dplyr::mutate(
+        SurvDate = lubridate::mdy(SurvDate),
+        ClusterId = paste(EventId, ClusterNumber, sep = "_clus"),
+        InStrip = StripPos!=-1,
+        LifeStage = case_when(
+          LifeStage == "A" ~ "Adult",
+          LifeStage == "J" ~ "Juvenile",
+          LifeStage == "UNK" ~ "UNK"),
+        Sex = case_when(
+          Sex == "F" ~ "Female",
+          Sex == "M" ~ "Male",
+          Sex == "UNK" ~ "UNK")
+        ) %>%
+      tidyr::replace_na(list(LifeStage = "UNK", Sex = "UNK")) %>% # for any remaining
+      dplyr::mutate(StageSex = paste0(LifeStage, Sex),
+                    StageSex = factor(StageSex, levels = c("AdultFemale", "AdultMale", "AdultUNK", "JuvenileUNK", "UNKUNK"))) %>%
+      dplyr::select(-StripPos)
+    
+    common_clusters <- data.frame(table(dat$ClusterId, dat$Surveyor)>0) %>%
+        tibble::rownames_to_column(var = "ClusterId")
+    
+    return_list <- list(dat_SS = dat, dat_cov = dat_cov, df_ClustersInCommon = common_clusters)
+  
+    return(return_list)
+    }
+
+FuncSubDat <- function(dat_SS, common_clus, Surveyor1, Surveyor2, allowed_diff) {
+    clusters_in_common <- common_clus$ClusterId[common_clus[Surveyor1] & common_clus[Surveyor2]]
+  temp_diff <- dat_SS %>%
+    dplyr::filter(ClusterId %in% clusters_in_common) %>%
+    dplyr::mutate(Surveyor=replace(Surveyor, Surveyor==eval(Surveyor1), "Surveyor1"),
+                  Surveyor=replace(Surveyor, Surveyor==eval(Surveyor2), "Surveyor2")) %>%
+    dplyr::filter(Surveyor %in% c("Surveyor1", "Surveyor2"))
+  
+  # stage match status
+  stage_match <- temp_diff %>%
+    dplyr::count(ClusterId, LifeStage, Surveyor) %>%
+    tidyr::spread(key = Surveyor, value = n) %>%
+    tidyr::replace_na(list(Surveyor1=0, Surveyor2 = 0)) %>%
+    dplyr::mutate(DiffCount = Surveyor2 - Surveyor1) %>% 
+    dplyr::select(ClusterId, DiffCount) %>% 
+    group_by(ClusterId) %>% 
+    dplyr::summarize(StageCountMatch = sum(abs(DiffCount))<= allowed_diff)
+  
+  # stage-sex diff and match status
+  ss_diff <- temp_diff %>%
+    dplyr::count(ClusterId, StageSex, Surveyor) %>%
+    tidyr::spread(key = Surveyor, value = n) %>%
+    tidyr::replace_na(list(Surveyor1=0, Surveyor2 = 0)) %>%
+    dplyr::mutate(DiffCount = Surveyor2 - Surveyor1) %>%
+    dplyr::arrange(desc(DiffCount))
+  
+  ss_match <- ss_diff %>% dplyr::select(ClusterId, DiffCount) %>% group_by(ClusterId) %>% dplyr::summarize(StageSexMatch = sum(abs(DiffCount))<=allowed_diff)
+  
+  # summary of total diffs
+  tot_diff <- temp_diff %>%
+    dplyr::count(ClusterId, Surveyor) %>%
+    tidyr::spread(key = Surveyor, value = n) %>%
+    tidyr::replace_na(list(Surveyor1 = 0, Surveyor2 = 0)) %>%
+    dplyr::mutate(DiffCount = Surveyor2 - Surveyor1,
+                  TotCountMatch = abs(DiffCount)<=allowed_diff) %>% 
+    dplyr::left_join(stage_match, by = "ClusterId") %>%
+    dplyr::left_join(ss_match, by = "ClusterId") %>%
+    arrange(desc(DiffCount))
+  
+  return_list <- list(tot_diff = tot_diff, ss_diff = ss_diff)
+  return(return_list)
+}
+
+# Function to create summary plots and tables of count differences 
+FuncDiff <- function(dat_SS, dat_cov, common_clus, Surveyor1, Surveyor2) {
+  sub <- FuncSubDat(dat_SS = dat_SS, common_clus = common_clus, Surveyor1 = Surveyor1, Surveyor2 = Surveyor2, allowed_diff = 0)
+  
+  # scatterplot of total diffs
+  tot_diff_aggr <- sub$tot_diff %>%
+    dplyr::count(Surveyor1, Surveyor2, DiffCount) %>%
+    dplyr::mutate(Match = ifelse(DiffCount==0, "Counts Match", "Counts Differ"))
+    
+  plotly_margins <- list (l = 0, r = 0, b = 0, t = 130, pad = 4) # top margin is so title doesn't run into plotly icons
+
+  point_tot_diff <- plot_ly(
+  data = tot_diff_aggr, 
+  x = ~Surveyor1, 
+  y = ~Surveyor2, 
+  type = "scatter", 
+  mode = "markers",
+  size = ~n,
+  hovertemplate = ~paste(input$sel_Surveyor1, "count:", Surveyor1, "<br>", input$sel_Surveyor2, "count:", Surveyor2, "<br> Number of clusters: ", n),
+  color = ~Match,
+  colors = c("Counts Match" = "black", 
+             "Counts Differ" = "orange"),
+  marker = list(opacity = 0.6, sizemode = "area", sizeref = 0.5)) %>%
+    layout(
+      font = list(size = 12),
+    margin = plotly_margins,
+    legend= list(
+      itemsizing="constant", # generates warnings that go away when size and color are set within marker, but doesn't work correctly that way
+      orientation = "h",   # show entries horizontally
+      y = 1,
+      yanchor = "top",
+      xanchor = "center",  # use center of legend as anchor
+      x = 0.5),
+    title = paste0(input$sel_Surveyor2, " mismatched ", input$sel_Surveyor1, " TOTAL count at\n", sum(sub$tot_diff$DiffCount!=0, na.rm = TRUE), " of ", nrow(sub$tot_diff), " clusters (", round(sum(sub$tot_diff$DiffCount!=0, na.rm = TRUE)/nrow(sub$tot_diff)*100), "%), shown as orange bubbles"),
+    xaxis=list(
+      title=paste(input$sel_Surveyor1, "'s count of cave crickets in cluster"),
+      range=c(-3, round(max(tot_diff_aggr$Surveyor1, tot_diff_aggr$Surveyor2, na.rm = TRUE) * 1.1)),
+      constrain = "domain"),
+      yaxis=list(
+        title=paste(input$sel_Surveyor2, "'s count of cave crickets in cluster"), 
+        tickprefix = "      ",
+        range=c(-3, max(tot_diff_aggr$Surveyor1, tot_diff_aggr$Surveyor2, na.rm = TRUE)+5), # don't set minimum to zero because zero points will be cut in half
+        constrain = "domain", # constraining to domain has the yaxis min set to the range; otherwise the zeroline extends far out to the left
+        scaleratio = 1, # keep aspect ratio
+        scaleanchor = "x"))
+  
+  # bar plot of total diffs
+  bar_tot_diff <- plot_ly(
+    data = tot_diff_aggr %>% dplyr::group_by(DiffCount) %>% dplyr::summarise(sum_n = sum(n)), 
+    x = ~DiffCount,
+    y = ~sum_n,
+    type="bar",
+    hovertemplate = ~paste("Difference in TOTAL count:", DiffCount, "<br>Number of clusters:", sum_n),
+    marker = list(
+      color = "lightblue", 
+      showLegend = FALSE)) %>%
+    layout(
+      font = list(size = 12),
+      margin = plotly_margins,
+      title = paste0("Difference in total counts for cave cricket clusters ranged from ", min(tot_diff_aggr$DiffCount, na.rm = TRUE), " to ", max(tot_diff_aggr$DiffCount, na.rm = TRUE)),
+      bargap = 0.01,
+      xaxis=list(
+        title=paste0("Difference in surveyors' counts (", input$sel_Surveyor2, " - ", input$sel_Surveyor1, ")")),
+      yaxis = list(
+        title = "Number of cave cricket clusters",
+        tickprefix = "      ")
+      )
+  
+  # summary of SS diffs
+  
+  heat_dat_diff <- sub$ss_diff %>%
+    dplyr::left_join(sub$tot_diff %>% dplyr::select(ClusterId, TotDiff = DiffCount), by = "ClusterId") %>% 
+    dplyr::filter(DiffCount!=0) %>% # only keep records where stage-sex counts differed
+    dplyr::mutate(ClusterId = paste0(ClusterId, "  (", TotDiff, ")")) 
+  
+  # heatplot of SS diffs
+  heat_ss_diff <- ggplot(heat_dat_diff, aes(x = StageSex, y = ClusterId, fill = DiffCount)) +
+    geom_tile(color = "gray") +
+    geom_text(aes(label = DiffCount)) +
+    scale_x_discrete(position = "top") +
+    scale_y_discrete(limits = rev) + # reverse order of clusters on y axis, (though only gets the events in the correct order, not the clusters within events)
+    scale_fill_gradient2(low = "#F0E442", high = "#CC79A7", limits=c(-6, 6), oob=scales::squish, breaks = seq(from = -6, to = 6, by = 2), name = "Difference in STAGE-SEX Count (partial legend shown)") + # oob squish condenses coloring of the more extreme values
+    labs(
+      title = paste0(Surveyor2, " mismatched ", Surveyor1, "in STAGE-SEX counts at ", length(unique(heat_dat_diff$ClusterId)), " of ", length(unique(sub$tot_diff$ClusterId)), " clusters (", round((length(unique(heat_dat_diff$ClusterId))/length(unique(sub$tot_diff$ClusterId)))*100), "%)"),
+      subtitle = paste0("Negative (yellow) is ", Surveyor1, "'s call, positive (purple) is ", Surveyor2, "'s call\nTotal difference is in parentheses (", Surveyor2, " - ", Surveyor1, ")\nTop panel shows clusters with DIFFERENT TOTAL COUNTS\nBottom panel shows clusters with SAME TOTAL COUNT")) +
+    theme_bw(base_size = 14) +
+    facet_grid(TotDiff==0 ~ ., scales = "free", space = "free_y") +
+    theme(legend.position="top",
+          strip.text.y = element_blank(),
+          panel.grid = element_blank(),
+          plot.title = element_text(size = 18), 
+          plot.subtitle = element_text( size = 16))
+  
+  table_dat <- sub$tot_diff %>%
+    dplyr::left_join(dat_cov %>% dplyr::select(ParkCode, Entrance, SurvDate, EventId, ClusterId, ClusterCountEstimate, StripPosMin, ClusterSpan, ClusterDistance_meter, ClusterLocation, ClusterNotes, ClusterDataEntryFlag, ClusterDataEntryFlagComment), by = "ClusterId") %>%
+    dplyr::select(ParkCode, Entrance, SurvDate, EventId, ClusterId, Surveyor1, Surveyor2, DiffCount, TotCountMatch, StageCountMatch, StageSexMatch, everything())
+  
+  #table 
+  table_diff <- reactable(
+    table_dat,
+    columns = list(
+      ParkCode = colDef(name = "Park Code", align = "center"),
+      Entrance = colDef(name = "Cave Entrance", align = "center"),
+      SurvDate = colDef(name = "Survey Date", format = colFormat(date = TRUE), align = "center"),
+      EventId = colDef(name = "Event ID", align = "center"),
+      ClusterId = colDef(name = "Cluster ID", align = "center"),
+      Surveyor1 = colDef(header = with_tooltip(paste0(input$sel_Surveyor1, " Counts"), paste0(input$sel_Surveyor1, "'s count of crickets for this cluster")), align = "center"),
+      Surveyor2 = colDef(header = with_tooltip(paste0(input$sel_Surveyor2, " Counts"), paste0(input$sel_Surveyor2, "'s count of crickets for this cluster")), align = "center"),
+      DiffCount = colDef(header = with_tooltip(paste0("Difference in TOTAL Counts (", input$sel_Surveyor2, " - ", input$sel_Surveyor1, ")"), "difference in total counts between selected surveyors"), align = "center"),
+      TotCountMatch = colDef(header = with_tooltip("Total Counts Match?", "TRUE or FALSE, do total counts match between the surveyors?"), align = "center"),
+      StageCountMatch = colDef(header = with_tooltip("Lifestage Counts Match?", "TRUE or FALSE, do the counts of each lifestage (e.g., count of adults) match between the surveyors?"), align = "center"),
+      StageSexMatch = colDef(header = with_tooltip("Stage-Sex Counts Match?", "TRUE or FALSE, do the counts of each stage-sex class (e.g., count of adult females) match between the surveyors?"), align = "center"),
+      ClusterCountEstimate = colDef(header = with_tooltip("Field count", "Field estimate of # of cave crickets in cluster"), align = "center"),
+      StripPosMin = colDef(header = with_tooltip("Strip position (m)", "Minimum transect location (m) along baseline"), align = "center"),
+      ClusterSpan = colDef(header = with_tooltip("Cluster span", "Width of cluster along transect, in transect units"), align = "center"),
+      ClusterDistance_meter = colDef(header = with_tooltip("Cluster Distance (m)", "Distance (m) from cluster to baseline"), align = "center"),
+      ClusterLocation = colDef(header = with_tooltip("Cluster Location", "C = ceiling, W = wall"), align = "center"),
+      ClusterNotes = colDef(name = "NOTES", align = "center"),
+      ClusterDataEntryFlag = colDef(name = "Data Entry Flag", align = "center"),
+      ClusterDataEntryFlagComment = colDef(name = "Data Entry Flag NOTES", align = "center")
+      ),
+      details = function(index) {
+      data_by_cluster <- sub$ss_diff[sub$ss_diff$ClusterId == table_dat$ClusterId[index], ]
+      htmltools::div(style = "padding: 50px",
+                     reactable(data_by_cluster,
+                               columns = list(
+                                 ClusterId = colDef(show = FALSE, minWidth = 200, align = "center"),
+                                 StageSex = colDef(name = "Stage-Sex Class", minWidth = 200, align = "center"),
+                                 Surveyor1 = colDef(header = with_tooltip(paste0(input$sel_Surveyor1, "Counts"), paste0(input$sel_Surveyor1, "'s count of crickets")), minWidth = 200, align = "center"),
+                                 Surveyor2 = colDef(header = with_tooltip(paste0(input$sel_Surveyor2, "Counts"), paste0(input$sel_Surveyor2, "'s count of crickets")), minWidth = 200, align = "center"),
+                                 DiffCount = colDef(header = with_tooltip("# Difference in STAGE-SEX Counts", "difference in stage-sex counts between selected surveyors"), minWidth = 200, align = "center")
+      ),
+      defaultSorted = list(StageSex = "asc"),
+                               resizable = TRUE,
+                               filterable = FALSE,
+                               striped = FALSE,
+                               highlight = TRUE,
+                               showSortIcon = FALSE,
+                               compact = TRUE,
+                               pagination = FALSE,
+                               outlined = FALSE,
+                               bordered = FALSE,
+  fullWidth = FALSE,
+                               theme = reactableTheme(backgroundColor = "hsl(186, 56%, 94%)")
+  )
+  )
+    },
+    resizable = TRUE,
+    filterable = TRUE,
+    striped = FALSE,
+    highlight = TRUE,
+    showSortIcon = TRUE,
+    compact = FALSE,
+    bordered = TRUE,
+    showPageSizeOptions = TRUE,
+    pageSizeOptions = c(10, 15, 25, 35),
+    defaultPageSize = 15)
+  
+  rv$df_TotDiff <- table_dat # same as sub$tot_diff but has cluster covariates added
+  rv$bar_TotDiff <- bar_tot_diff
+  rv$point_TotDiff <- point_tot_diff
+  rv$df_SSDiff <- sub$ss_diff
+  rv$heatplot_SSDiff <- heat_ss_diff 
+  rv$table_Diff <- table_diff # this is a reactable
+}
+
+FuncTreeDat <- function(dat_SS, dat_cov, common_clus, Surveyor1, Surveyor2, allowed_diff, response) {
+  sub <- FuncSubDat(dat_SS = dat_SS, common_clus = common_clus, Surveyor1 = Surveyor1, Surveyor2 = Surveyor2, allowed_diff = allowed_diff)
+  
+  dat_tree <- sub$tot_diff %>%
+    dplyr::rename(Surveyor1Count = Surveyor1, Surveyor2Count = Surveyor2, Response = eval(response)) %>%
+    dplyr::left_join(dat_cov[, c("ClusterId", "ClusterSpan", "ClusterDistance_meter", "ClusterLocation", "ClusterCountEstimate")], by = "ClusterId") %>%
+    filter(complete.cases(.)) %>%
+    dplyr::mutate(
+      Response = ifelse(Response, "Match", "Mismatch"),
+      FieldCountMatch = ifelse(abs(Surveyor1Count - ClusterCountEstimate) <= allowed_diff, "Match", "Mismatch"))
+  dat_tree$FieldCountMatch <- factor(dat_tree$FieldCountMatch, levels = c("Match", "Mismatch"))
+  dat_tree$Response <- factor(dat_tree$Response, levels = c("Match", 
+  "Mismatch")) # caret considers the first level to be the positive response
+  dat_tree$Surveyor2Name = Surveyor2
+  return(dat_tree)
+  }
+
+FuncTreeModel <- function(mod, data_train, FP_loss = 1, min_bucket) {
+  set.seed(1111) #makes each code block reproducible
+  cv_control <- trainControl(method="repeatedcv", number=15, repeats=10, summaryFunction=twoClassSummary, classProbs=T, savePredictions = T) 
+
+  loss_matr <- matrix(c(0, FP_loss, 1, TN = 0), byrow = T, nrow = 2) # cost of false positives is 5X that of false negatives
+  
+  set.seed(1111)
+  fit_rpart = caret::train(mod, data=data_train, method="rpart",  metric="ROC", trControl = cv_control, control = rpart.control(minbucket = min_bucket), parms = list(loss = loss_matr), na.action = na.pass, tuneLength = 10)
+  
+  return_list <- list(mod, data_train, fit_rpart)
+  names(return_list) <- c("model", "data_train", "mod_rpart")
+  return(return_list)
+}
+```
+
+```{r action_buttons}
+# (Home) Import and format new data ----
+observeEvent(eventExpr = input$button_Import, {
+  withProgress(message = "Importing and processing new data files...", detail = "you will see a pop-up message when completed",  value = 0, {
+    vec_score_files = list.files(path = './Data_in', pattern = "^Scores_.*\\.csv") # identify all .csv files in the Data_in folder
+    shiny::validate(need(length(vec_score_files) > 0, "No scoring data files (.csv) in the 'Data_in' folder. Please add the data files and try again."))
+    
+    cov_file_exists = file.exists(here::here("Data_in", "qryDashboardClusterCovariates.xlsx")) # TRUE if this file exists
+    shiny::validate(need(cov_file_exists == TRUE, "Could not find a cluster covariate file (qryDashboardClusterCovariates.xlsx) in the 'Data_in' folder. Please add the covariate file and try again."))
+    
+    out <- FuncImport(score_files = vec_score_files)
+    
+    # Save to dashboard environment
+    rv$dat_SS <- out$dat_SS
+    rv$dat_cov <- out$dat_cov
+    rv$df_ClustersInCommon <- out$df_ClustersInCommon
+    rv$df_TotDiff <- rv$bar_TotDiff <- rv$point_TotDiff <- rv$df_SSDiff <- rv$heatplot_SSDiff <- rv$table_Diff <- NULL
+  
+    # Save to local directory
+  showModal( # Pop-up modal asking user to enter prefix to append to saved files
+    modalDialog(
+      textInput("out_prefix", "Prefix to append to output files: ",
+                placeholder = paste0("CricketDashData_", paste0(gsub(pattern = "-", replacement = "", x = Sys.Date()))),
+                value = paste0("CricketDashData_", paste0(gsub(pattern = "-", replacement = "", x = Sys.Date())))
+      ),
+      footer = tagList(
+        actionButton("button_goSave", "SAVE")
+      )
+    ))
+  
+  observeEvent(input$button_goSave, {
+    saveRDS(out, paste0("Data_out/", input$out_prefix, ".RDS"))
+    
+    showModal(modalDialog(
+      title = "Done",
+      paste0("The data for dashboard use have been saved as '", input$out_prefix, ".RDS' in the folder 'Data_out' of the current working directory, ", getwd(), ". You may now view data summaries and analysis outputs in the other dashboard pages.") 
+    ))
+  })
+    
+  })
+  
+  }, ignoreInit = TRUE) # end of observeEvent 
+    
+# (Home) Load data as RDS ----
+observeEvent(eventExpr = input$button_LoadRDS, {
+  showModal(modalDialog(
+    fileInput("saved_data_file", label = "Import data already formatted for dashboard use ('RDS' extension)", placeholder = "Click 'Browse...' button then navigate to file", accept = c('.RDS'), width = "100%"),
+    footer = tagList(
+      modalButton("Cancel")
+    )
+  ))
+})
+
+observeEvent(eventExpr = input$saved_data_file, {
+  shiny::req(!is.null(input$saved_data_file$datapath))
+  
+  if(!toupper(tools::file_ext(input$saved_data_file$datapath)) %in% c("RDS")) {
+    showModal(modalDialog(
+    title = "Error",
+    "File must have .RDS extension. Please select a different file."
+    ))
+  } else {
+
+    tryCatch(out <- readRDS(input$saved_data_file$datapath),
+             error = function(e) {out <- NULL; print("Cannot import the selected file")})
+
+  shiny::req(!is.null(out))
+  
+  rv$dat_SS <- out$dat_SS
+  rv$dat_cov <- out$dat_cov
+  rv$df_ClustersInCommon <- out$df_ClustersInCommon
+  rv$df_TotDiff <- rv$bar_TotDiff <- rv$point_TotDiff <- rv$df_SSDiff <- rv$heatplot_SSDiff <- rv$table_Diff <- NULL
+  }
+
+  Sys.sleep(0.25)
+  showModal(modalDialog(
+  title = "Done",
+  "The data have been imported. You may now view data summaries and analysis outputs in the other dashboard pages."
+  ))
+})
+
+# Refresh Diff Summaries ----
+observeEvent(eventExpr = input$button_RefreshSummaries, {
+  shiny::req(!is.null(rv$dat_SS), !is.null(rv$df_ClustersInCommon), !is.null(input$sel_Surveyor1), !is.null(input$sel_Surveyor2))
+  
+  if(input$sel_Surveyor1 == input$sel_Surveyor2) {
+    showModal(modalDialog(
+    title = "Error",
+    "Cannot compare a surveyor to him/herself. Surveyor 1 must be different from Surveyor 2."
+    ))
+    }
+  
+  shiny::req(input$sel_Surveyor1 != input$sel_Surveyor2)
+  withProgress(message = "Generating plots", detail = "...updating plots", value = 0, {
+  rv$df_TotDiff <-  rv$bar_TotDiff <- rv$point_TotDiff<- rv$df_SSDiff <-  rv$heatplot_SSDiff <- rv$table_Diff <- NULL
+    
+  FuncDiff(dat_SS = rv$dat_SS, dat_cov = rv$dat_cov, common_clus = rv$df_ClustersInCommon, Surveyor1 = input$sel_Surveyor1, Surveyor2 = input$sel_Surveyor2)
+  Sys.sleep(1)
+  })
+  
+})
+
+# Generate classification tree ----
+
+observeEvent(eventExpr = input$button_GenerateTree, {
+  shiny::req(!is.null(rv$dat_SS),  !is.null(input$sel_Tree_Surveyor1), !is.null(input$sel_Tree_Surveyor2), !is.null(input$sel_Tree_AllowedDiff), !is.null(input$sel_Tree_ResponseMetric), !is.null(input$sel_Tree_FPloss))
+  
+  if(input$sel_Tree_Surveyor1 == input$sel_Tree_Surveyor2) {
+    showModal(modalDialog(
+    title = "Error",
+    "Cannot compare a surveyor to him/herself. Surveyor 1 must be different from Surveyor 2."
+    ))
+    }
+  
+  shiny::req(input$sel_Tree_Surveyor1 != input$sel_Tree_Surveyor2)
+  withProgress(message = "Running classification model...", detail = "this may take a little bit", value = 0, {
+  rv$df_Tree <- rv$list_TreeOut <- rv$mat_TestAccuracy <- NULL
+  
+  ### Format data and make pairs plot for classification tree analysis
+if(input$sel_Tree_Surveyor2 == "All") { # One surveyor vs all others
+  
+  # format data
+  list_Diff <- lapply(
+    as.list(unique(rv$dat_SS$Surveyor)[unique(rv$dat_SS$Surveyor) != input$sel_Tree_Surveyor1]),
+    FUN = function(x) {FuncTreeDat(dat_SS = rv$dat_SS, dat_cov = rv$dat_cov, common_clus = rv$df_ClustersInCommon, Surveyor1 = input$sel_Tree_Surveyor1, Surveyor2 = x, allowed_diff = input$sel_Tree_AllowedDiff, response = input$sel_Tree_ResponseMetric)}
+    )
+  dat_tree <- do.call("rbind", list_Diff) 
+  
+
+  
+  # full model
+  mod_full = as.formula("Response ~ Surveyor1Count + Surveyor2Name + ClusterSpan + ClusterDistance_meter + ClusterLocation + FieldCountMatch")
+  
+  } else { # One surveyor vs another
+    
+    # format data
+    dat_tree <- FuncTreeDat(dat_SS = rv$dat_SS, dat_cov = rv$dat_cov, common_clus = rv$df_ClustersInCommon, Surveyor1 = input$sel_Tree_Surveyor1, Surveyor2 = input$sel_Tree_Surveyor2, allowed_diff = input$sel_Tree_AllowedDiff, response = input$sel_Tree_ResponseMetric) 
+    
+    # full model
+    mod_full = as.formula("Response ~ Surveyor1Count + ClusterSpan + ClusterDistance_meter + ClusterLocation + FieldCountMatch")
+  }
+  
+  # Make sure sufficient mismatches to continue
+      if(sum(dat_tree$Response=="Mismatch") < 8) {
+      showModal(modalDialog(
+            title = "Not Enough Count Mismatches",
+            "Need at least 8 surveyor count mismatches to generate classification models. Please make another selection."
+            ))}
+      shiny::req(sum(dat_tree$Response=="Mismatch") >= 8)
+  
+  ### Split data into 70/30 train/test
+  set.seed(123)
+  trainset <- caret::createDataPartition(y = dat_tree$Response, p = 0.7, list = FALSE)
+  data_train = dat_tree[trainset,] #extract observations/rows for training, assign to new variable
+  data_test = dat_tree[-trainset,] #do the same for the test set
+  
+  ### Run model
+  list_treeout <- FuncTreeModel(mod = mod_full, data_train = data_train, FP_loss = input$sel_Tree_FPloss, min_bucket = input$sel_MinBucket) # FP_loss means that a false positive is X times more "costly" than a false positive. False positive means that we think it's a match but it's actually a mismatch--so a higher FP_loss value means we really want to be able to find those mismatches. Matrix top row is TP (left), FP (right); bottom row is FN, TN. 
+  
+  ### Examine predictive accuracy of rpart model, on the TEST data
+  pred = predict(list_treeout$mod_rpart, data_test)
+  rv$mat_TestAccuracy <- confusionMatrix(data_test$Response, pred) # note that if FP_loss is different from 1, overall accuracy may be lower but skewing toward the less costly "mistake". Sensitivity is True Positive Rate. Specificity is True Negative Rate. So we are typically interested in getting higher specificity because it means we catch more of the mismatches.###
+
+  dat_tree$TestTrain <- "test"
+  dat_tree$TestTrain[trainset] <- "train"
+  
+  rv$df_Tree <- dat_tree
+  rv$list_TreeOut <- list_treeout
+  Sys.sleep(1)
+  })
+})
+
+  
+```
+
+    
+HOME
+=========================================
+
+Column {data-width=1}
+-------------------------------------
+
+Column {data-width=30}
+-------------------------------------
+
+```{r image1, echo = FALSE}
+htmltools::img(src="images/Dashboard_Img_1.jpg", width = "100%", style="display:block; margin-top:10px; align:center;") # alternatively... margin-top:10px; margin-bottom:0px; margin-right:40px; margin-left:-20px"
+```
+
+```{r image2, echo = FALSE}
+htmltools::img(src="images/Dashboard_Img_2.jpg", width = "100%", style="display:block; align:center;")
+```
+
+
+Column {data-width=2}
+-------------------------------------
+
+Column {data-width=66}
+-------------------------------------
+
+#### <font size="5">CUPN Cave Cricket Monitoring</font> 
+
+<font size="4"> 
+This dashboard is an interactive tool for visualizing cave cricket monitoring data. To begin, click one of the green buttons below to either import raw data or to load data as a formatted .RDS file. Hover over data points in maps or graphs to see summary information. All graphs can be exported as .png files.</font>
+
+```{r}
+actionButton("button_Import", "Import New Data",
+             style="color:black; background-color: lightgreen; border:2px; margin:5px; width:200px; display:inline-block;")
+
+actionButton("button_LoadRDS", "Load an Existing RDS File",
+             style="color:black; background-color: lightgreen; border:2px; margin:5px; width:230px; display:inline-block;")
+
+```
+
+#### <font size="4">**Instructions for Importing New Data**</font>
+
+<font size="4"> 
+
+1.  Export (as .xlsx) the Access qry results from qryDashboardClusterCovariates. The file should have these required columns (case-sensitive): *EventID, StartDate, ParkCode, LocationDescription, ClusterNumber, BaselinePosition_meter, XminRelativeToStrip_cm, XmaxRelativeToStrip_cm, ClusterDistance_meter, ClusterLocation, ClusterCountEstimate, ClusterDataEntryFlag, ClusterDataEntryFlagComment, Comment* (where "EventID" is a an integer, e.g., "47"; "ClusterLocation" is recorded as "C" or "W"; and "ClusterDataEntryFlag is recorded as TRUE or FALSE)    
+
+2.  Create scoring data files (as .csv) and save them with the file name format "Scores_xxx_yyy.csv", where "xxx" is the name assigned to a scorer and "yyy" can be any other text. An underscore is required after "Scores" and also after the scorer's name. The file must end in ".csv". An example of a valid file name is "Scores_BartSimpson_blah123blah_blah.csv". Each scoring file should have these required columns (case-sensitive): *FID, EventID, ClusterN, Date, Sex, Life_stage, Strip_Pos* (where "EventID" is a number preceded by "CC_", e.g., "CC_47"; "Sex" is recorded as "M", "F", or "U"; and "Life_stage" is recorded as "A", "J", or "U"; "Strip_Pos" is recorded as "-1" if the cricket is out-of-strip)
+
+3.  Place all files (for import) in the "Data_in" subfolder located in the dashboard's working directory. This subfolder should include ONLY the files you want to import.
+
+4.  In the dashboard, select the green "Import New Data" button. When data import and formatting is completed, the dashboard-ready .RDS file will be saved in the "Data_out" subfolder of the dashboard working directory. You may then proceed to the remaining dashboard pages to view data QAQC summaries and regression tree outputs.
+
+</font>
+
+#### <font size="4">**Instructions for Loading an Existing RDS File**</font>
+
+<font size="4"> 
+
+1.  In the dashboard, select the green "Import New Data" button. Browse to and select the dashboard-ready .RDS file on your computer. A pop-up window will notify you that the .RDS file is loaded. You may then proceed to the remaining dashboard pages to view data QAQC summaries and regression tree outputs.
+
+</font> 
+
+Column {data-width=1}
+-------------------------------------
+
+Differences in Counts Between Two Surveyors
+====================================== 
+
+Inputs {.sidebar data-width=250}
+-------------------------------------
+
+```{r mainInput}  
+renderUI({
+  shiny::req(!is.null(rv$dat_SS))
+ 
+  selectInput(
+    "sel_Surveyor1",
+    label = strong("Select Surveyor1 to Compare: "),
+    choices = sort(unique(rv$dat_SS$Surveyor)),
+    selected = switch(is.null(input$sel_Surveyor1)+1, input$sel_Surveyor1, sort(unique(rv$dat_SS$Surveyor))[1])
+    )
+  })
+
+renderUI({
+  shiny::req(!is.null(rv$dat_SS))
+  selectInput(
+    "sel_Surveyor2",
+    label = strong("Select Surveyor2 to Compare: "),
+    choices = sort(unique(rv$dat_SS$Surveyor)),
+    selected = switch(is.null(input$sel_Surveyor2)+1, input$sel_Surveyor2, sort(unique(rv$dat_SS$Surveyor))[2])
+    )
+  })
+
+actionButton("button_RefreshSummaries", "Refresh Summaries",
+             style="color:black; background-color: lightgreen; border:2px; margin:5px; display:inline-block;")
+
+```
+
+Column {.tabset .tabset-fade}
+-------------------------------------
+
+### Differences in TOTAL Count
+
+<div style='display:flex; flex-direction:row; max-width:100%; justify-content:space-evenly; flex-wrap: wrap; align-items: center;'>
+
+<div style='flex: 0 0 35%; border:1px solid gray; padding:5px;'>
+
+**Pairs plot of surveyor counts**
+<br>
+Size of point is scaled to number of data records. Hover over points for more information.
+```{r}
+renderPlotly({
+  if(any(is.null(rv$dat_SS), is.null(rv$point_TotDiff))) {
+    p_pairs <- plotly_empty(type = "scatter", mode = "markers") %>% layout(title = list(text = "No data to show", yref = "paper", y = 0.5))
+    } else {
+      p_pairs <- rv$point_TotDiff
+    }
+  
+  p_pairs
+})
+```
+</div>
+
+<div style='flex: 0 0 60%; border:1px solid gray; padding:5px;'>
+
+**Histogram of count differences between selected surveyors**
+<br>
+Hover over bars for more information
+```{r}
+renderPlotly({
+  if(any(is.null(rv$dat_SS), is.null(rv$bar_TotDiff))) {
+    p_hist <- plotly_empty(type = "scatter", mode = "markers")  %>% layout(title = list(text = "No data to show", yref = "paper", y = 0.5))
+    } else {
+      p_hist <- rv$bar_TotDiff
+    }
+  
+  p_hist
+})
+```
+</div>
+
+<div style='flex: 1 0 100%; margin-top:30px;'>
+
+**Cave cricket clusters with mismatched count totals**
+<br>
+For full table with more details, see 'Table of Count Differences' tab
+```{r}
+renderTable({
+  shiny::req(!is.null(rv$df_TotDiff))
+  quick_tab <- rv$df_TotDiff %>% 
+    dplyr::filter(DiffCount != 0) %>%
+    dplyr::arrange(desc(DiffCount)) %>%
+    dplyr::mutate(Surveyor1 = as.integer(Surveyor1), Surveyor2 = as.integer(Surveyor2), DiffCount = as.integer(DiffCount)) %>%
+    dplyr:: select(`Park Code` = ParkCode, Entrance, `Cluster ID` = ClusterId, `Surveyor 1 Count` = Surveyor1, `Surveyor 2 Count` = Surveyor2, `Difference in Counts` = DiffCount)
+  
+  quick_tab
+  }, striped = TRUE, spacing = "xs", align = "c", rownames = FALSE)
+```
+</div>
+
+</div>
+
+### Matrix of Differences in Count by STAGE-SEX (only showing mismatched clusters)
+
+```{r}
+output$out_HeatPlot <- renderPlot({
+  if(any(is.null(rv$dat_SS), is.null(rv$df_SSDiff), is.null(rv$heatplot_SSDiff))) {
+    p_heat <- ggplot() + labs(title = "No data to show") + theme_void(base_size = 14)
+  } else {
+    p_heat <- rv$heatplot_SSDiff
+  }
+  
+  p_heat
+  },
+  height = reactive({switch(is.null(rv$heatplot_SSDiff)+1, 40 + length(unique(rv$heatplot_SSDiff$data$ClusterId))*20, 200)})
+)
+tags$style("#out_HeatPlot{height:100vh;overflow-x:scroll;overflow-y:scroll}")
+plotOutput("out_HeatPlot", height="100%", width = "80%")
+```
+
+### Table of Count Differences (TOTAL and STAGE-SEX)
+
+#### <font size="3">**For each cave cricket cluster, the main table shows the difference in TOTAL cricket counts for the selected surveyors**</font>
+
+* Hover over a column name to see column definitions
+
+* To see summaries by STAGE-SEX for a cluster, select the black triangle to the left of the table row
+
+```{r}
+output$tab1 <- renderReactable({
+  shiny::req(!is.null(rv$dat_SS), !is.null(rv$df_TotDiff), !is.null(rv$df_SSDiff), !is.null(rv$table_Diff))
+  
+  rv$table_Diff
+})
+reactableOutput("tab1")
+tags$style("#tab1{height:100vh;overflow-x:scroll;overflow-y:scroll}")
+```
+
+Classification Tree Models for Count Mismatch
+====================================== 
+
+Inputs {.sidebar data-width=280}
+-------------------------------------
+
+Refer to the 'EXPLANATION OF CLASSIFICATION TREES' tab for information on classification tree models and interpreting model output
+
+<br>
+```{r treeInput} 
+renderUI({
+  selectInput(
+    "sel_Tree_ResponseMetric",
+    label = strong("Select a Response Metric: "),
+    choices = c("Difference in Total Count" = "TotCountMatch", "Difference in LifeStage Count" = "StageCountMatch"),
+    selected = switch(is.null(input$sel_Tree_ResponseMetric)+1, input$sel_Tree_ResponseMetric, "TotCountMatch")
+    )
+  })
+
+renderUI({
+  shinyBS::popify(numericInput(
+    "sel_Tree_AllowedDiff",
+    label = strong("'Mismatch' if Difference in Counts Exceeds:"),
+    value = switch(is.null(input$sel_Tree_AllowedDiff)+1, input$sel_Tree_AllowedDiff, 0),
+    min = 0,
+    max = 5,
+    step = 1
+    ), title = "If the count difference between Surveyor1 and Surveyor2 exceeds this value, the response class for that cluster is MISMATCH for the selected response metric (total count or lifestage count)", trigger = "click", placement = "top")
+}) # can't use single quotes in popover title
+
+renderUI({
+  shiny::req(!is.null(rv$dat_SS))
+  selectInput(
+    "sel_Tree_Surveyor1",
+    label = strong("Select Surveyor1: "),
+    choices = sort(unique(rv$dat_SS$Surveyor)),
+    selected = switch(is.null(input$sel_Tree_Surveyor1)+1, input$sel_Tree_Surveyor1, sort(unique(rv$dat_SS$Surveyor))[1])
+    )
+  })
+
+renderUI({
+  shiny::req(!is.null(rv$dat_SS))
+  shinyBS::popify(selectInput(
+    "sel_Tree_Surveyor2",
+    label = strong("Select Surveyor2:"),
+    choices = c(sort(unique(rv$dat_SS$Surveyor)), "All"),
+    selected = switch(is.null(input$sel_Tree_Surveyor2)+1, input$sel_Tree_Surveyor2, c(sort(unique(rv$dat_SS$Surveyor)), "All")[2])
+    ), title = "Selecting ALL analyzes count match/mismatch between Surveyor 1 and all other Surveyors. In this case, Surveyor2 Name is included as a predictor in classification models. Be careful when selecting ALL for Surveyor2--if surveyors vary greatly in the number of clusters they counted in common with Surveyor1, model results will be biased toward Surveyors with more clusters in common (with Surveyor1)", trigger = "click", placement = "top")
+})
+
+renderUI({
+  shinyBS::popify(numericInput(
+    "sel_Tree_FPloss",
+    label = strong("Select a multiplier for the relative 'cost' of False Matches:"),
+    value = switch(is.null(input$sel_Tree_FPloss)+1, input$sel_Tree_FPloss, 1),
+    min = 1,
+    max = 4,
+    step = 1
+    ), title = "By default, False Matches (i.e., surveyor counts mismatch but the model predicts a match) are weighted equally (relative cost = 1) with False MISmatches in the classification model. The user can choose to give False Matches a greater penalty. For example, setting relative cost = 2 means that the penalty for a False Match will be twice that for a False MISmatch", trigger = "click", placement = "top")
+})
+
+renderUI({
+  shinyBS::popify(numericInput(
+    "sel_MinBucket",
+    label = strong("What is the minimum number of observations in a node for a split to be attempted?"),
+    value = switch(is.null(input$sel_MinBucket)+1, input$sel_MinBucket, 3),
+    min = 1,
+    max = 10,
+    step = 1
+    ), title = "The number of training data observations in a node box must exceed this number for the node to undergo further splits", trigger = "click", placement = "top")
+})
+
+actionButton("button_GenerateTree", "Generate Classification Tree",
+             style="color:black; background-color: lightgreen; border:2px; margin:5px; display:inline-block;")
+```
+
+Column {.tabset .tabset-fade}
+-------------------------------------
+
+### Final Classification Tree Model (from Training Data)
+
+```{r}
+output$out_TreePlot <- renderPlot({
+  if(any(is.null(rv$dat_SS), is.null(rv$list_TreeOut))) {
+    p_tree <- ggplot() + labs(title = "No data to show") + theme_void(base_size = 14)
+  } else {
+    p_tree <- fancyRpartPlot(rv$list_TreeOut$mod_rpart$finalModel, main = paste0("Recursive partitioning classification tree model for ", input$sel_Tree_Surveyor1, " vs. ", input$sel_Tree_Surveyor2, ", ", input$sel_Tree_ResponseMetric))
+  } # each node shows the predicted class of the response, proportion Match (out of the number of records before that node split), and % of (total) observations in that group. The bottom row should add up to 100% of the data
+  
+  p_tree
+  })
+
+tags$style("#out_TreePlot{height:100vh;overflow-x:scroll;overflow-y:scroll}")
+plotOutput("out_TreePlot", height="100%", width = "80%")
+```
+
+### Prediction Accuracy and Model Tuning Summaries
+
+<div style='display:flex; flex-direction:row; max-width:100%; justify-content:space-evenly; flex-wrap: wrap; align-items: center;'>
+
+<div style='flex: 0 0 35%; border:1px solid gray; padding:5px;'>
+
+**Prediction accuracy, sensitivity, and specificity (ON TEST DATA)**
+<br>
+In confusion matrix at top, column sums yield the predicted response classifications (match or mismatch between observer pairs) and row sums yield the observed classifications in TEST data
+```{r}
+renderPrint({
+  shiny::req(!is.null(rv$dat_SS), !is.null(rv$mat_TestAccuracy))
+  rv$mat_TestAccuracy
+})
+```
+</div>
+
+<div style='flex: 0 0 60%; border:1px solid gray; padding:5px;'>
+
+**Model tuning plot (ON TRAINING DATA)** 
+<br>
+Relationship between model complexity parameter (cp) and ROC, with vertical red line showing cp used in final model
+```{r}
+renderPlotly({
+  if(any(is.null(rv$dat_SS), is.null(rv$list_TreeOut), is.null(rv$list_TreeOut$mod_rpart))) {
+    p_tune <- plotly_empty(type = "scatter", mode = "markers")  %>% layout(title = list(text = "No data to show", yref = "paper", y = 0.5))
+  } else {
+    if(nrow(rv$list_TreeOut$mod_rpart$results) ==1) {
+      p_tune <- plotly_empty(type = "scatter", mode = "markers")  %>% layout(title = list(text = "No plot to show. Model tuning had only one value for model complexity parameter (cp)", yref = "paper", y = 0.5))
+    } else {
+      p_tune <- ggplot(rv$list_TreeOut$mod_rpart) + geom_vline(xintercept = rv$list_TreeOut$mod_rpart$bestTune$cp, color = "red", linetype = "dotted", size = 1.5) + labs(title = "ROC as a function of model complexity parameter", subtitle = "Red dotted line shows complexity parameter used in final model") + theme_bw(base_size = 12)
+    }
+  }
+  
+  p_tune
+
+})
+```
+</div>
+
+<div style='flex: 1 0 100%; margin-top:30px;'>
+
+**Model tuning data (ON TRAINING DATA)**
+<br>
+Cp and ROC values correspond with model tuning plot (top right of page). Specificity and sensitivity calculations are for model on training data, so may differ from prediction summaries on test data (top left of page).
+```{r}
+renderTable({
+  shiny::req(!is.null(rv$list_TreeOut$mod_rpart$results))
+  rv$list_TreeOut$mod_rpart$results
+  }, striped = TRUE, spacing = "xs", align = "c", rownames = FALSE)
+```
+</div>
+
+</div>
+
+### Table of Training and Test Data
+
+```{r}
+output$treetab <- renderReactable({
+  shiny::req(!is.null(rv$dat_SS), !is.null(rv$df_Tree))
+    
+  reactable(
+    rv$df_Tree,
+    resizable = TRUE, 
+    filterable = TRUE,
+    striped = FALSE,
+    highlight = TRUE,
+    showSortIcon = TRUE,
+    compact = FALSE,
+    bordered = TRUE,
+    showPageSizeOptions = TRUE, 
+    pageSizeOptions = c(10, 15, 25, 35), 
+    defaultPageSize = 15) 
+})
+reactableOutput("treetab")
+tags$style("#treetab{height:100vh;overflow-x:scroll;overflow-y:scroll}")
+```
+
+### EXPLANATION OF CLASSIFICATION TREES
+
+#### <font size="3">**Overview of Classification Tree Models**</font>
+
+This dashboard runs recursive partitioning (rpart) and gradient boosted trees on the ...."Response ~ Surveyor1Count + ClusterSpan + ClusterDistance_meter + ClusterLocation + FieldCountMatch"Recursive partitioning classification tree models work by repeatedly splitting training data into  subgroups (node boxes), so that the outcomes the bottom-most row of node boxes (aka the terminal 'leaf' of the tree) is made up of as homogeneous response values (Mismatch or Match between surveyors, for total or lifestage count) as possible. The training data are a random 30 percent of the data, used to train the model. The final model is then applied on the test data (the remaining 70 percent of the data) to estimate model accuracy (see the 'Prediction Accuracy and Model Tuning Summaries' tab). In the final classification tree model, each node box shows:
+
+* (top row) The majority training data response class at that node i.e., Mismatch or Match. If Mismatch, the node box is colored blue; if match, green.
+
+
+* (middle row) The proportion (of prior node's data that meet the split criterion leading to the current node) with with response = Match (left side of middle row) vs. Mismatch (right side). The greater the "hit rate" (i.e., the proportion of training observations that belong to the most widely occurring response class), the better that split criterion distinguishes cave cricket clusters with matched vs. mismatched counts between surveyors.
+
+* (bottom row) The % of training data observations that actually arrive at the node (i.e., meet all split criteria leading to that node). The bottom row of node boxes adds up to approximately 100%.
+
+For each split, the criterion is listed as a logical question (e.g., ClusterDistanceMeter >= [some number]). The branch to the left of the split (and the resulting node) represents the answer "yes" to the logical question while the branch to the right represents "no". One slightly confusing split criterion is 'FieldCountMatchMismatch < 0.5'--the "yes" branch for this criterion means that the Field Count matched Surveyor 1's count of total crickets in that cluster. Field counts are not available for LifeStage Count, so are only relevant when the selected response is 'Difference in Total Count'.
+
+See https://www.datacamp.com/community/tutorials/decision-trees-R or https://www.machinelearningplus.com/machine-learning/caret-package/ for a deeper understanding of classification tree models (including CAVEATS OF INTERPRETATION) as implemented in this dashboard
+
+
+All Raw Count Data
+====================================== 
+
+### Table of Raw Data
+
+```{r}
+output$rawtab <- renderReactable({
+  shiny::req(!is.null(rv$dat_SS))
+    
+  reactable(
+    rv$dat_SS %>% dplyr::select(Fid, SurvDate, EventId, ClusterId, Surveyor, InStrip, LifeStage, Sex),
+    columns = list(
+      Fid = colDef(name = "FID", align = "center"),
+      SurvDate = colDef(name = "Survey Date", format = colFormat(date = TRUE), align = "center"),
+      EventId = colDef(name = "Event ID", align = "center"),
+      ClusterId = colDef(name = "Cluster ID", align = "center"),
+      Surveyor = colDef(align = "center"),
+      InStrip = colDef(name = "In Survey Strip?", align = "center"),
+      LifeStage = colDef(name = "Life Stage", align = "center"),
+      Sex = colDef(name = "Sex", align = "center")
+      ),
+    resizable = TRUE, 
+    filterable = TRUE,
+    striped = FALSE,
+    highlight = TRUE,
+    showSortIcon = TRUE,
+    compact = FALSE,
+    bordered = TRUE,
+    showPageSizeOptions = TRUE, 
+    pageSizeOptions = c(10, 15, 25, 35), 
+    defaultPageSize = 15) 
+})
+reactableOutput("rawtab")
+tags$style("#rawtab{height:100vh;overflow-x:scroll;overflow-y:scroll}")
+```

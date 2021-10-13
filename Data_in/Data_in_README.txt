@@ -1,0 +1,1 @@
+Cave cricket covariate data (.xlsx) and image scores (.csv) should be saved in this folder for use by the cave cricket dashboard
